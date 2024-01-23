@@ -1,0 +1,323 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+
+struct Shape
+{
+    float3 position;
+    float3 rotation;
+    float3 size;
+    float3 colour;
+    int shapeType;
+    int operationType;
+    float blendStrength;
+    int numChildren;
+};
+
+struct Ray
+{
+    float3 origin;
+    float3 direction;
+};
+
+Texture2D<float4> Source;
+RWTexture2D<float4> Destination;
+
+StructuredBuffer<Shape> Shapes;
+int numberShapes;
+
+float4x4 _CameraToWorld;
+float4x4 _CameraInverseProjection;
+
+float3 _Light;
+bool positionLight;
+
+static const float MAX_DST = 60;
+static const float EPSILON = .0001f;
+static const float SHADOW_BIAS = EPSILON * 50;
+static const float4 CAMERA_ORIGIN = float4(0,0,0,1);
+static const float4 INVERSE_PROJECTION = float4(0,0,0,1);
+
+float SphereDistance(const float3 p, const float3 center, const float radius)
+{
+    return distance(p, center) - radius;
+}
+
+float CubeDistance(const float3 p, const float3 center, const float3 dimension)
+{
+    // Calculate the signed distance of the rotated cube
+    const float3 offset = abs(p - center) - dimension;
+    const float unsignedDistance = length(max(offset, 0));
+    const float negativeDistance = max(max(min(offset.x, 0), min(offset.y, 0)), min(offset.z, 0));
+    
+    return unsignedDistance + negativeDistance;
+}
+
+float TorusDistance(float3 eye, float3 centre, float r0, float r1)
+{   
+    float2 q = float2(length((eye - centre).xz) - r0, eye.y - centre.y);
+    return length(q) - r1;
+}
+
+float ConeDistance(const float3 p, const float3 center, const float2 c, const float height)
+{
+    const float2 q = height * normalize(c);
+    const float2 w = float2(length(p.xz), p.y);
+    const float2 a = w - q * clamp(dot(w, q) / dot(q, q), 0.0, 1.0);
+    const float2 b = w - q * float2(clamp(w.x / q.x, 0.0, 1.0), 1.0);
+    const float k = sign(q.y);
+    const float d = min(dot(a, a), dot(b, b));
+    const float s = max(k * (w.x * q.y - w.y * q.x), k * (w.y - q.y));
+    return sqrt(d) * sign(s);
+}
+
+float CapsuleDistance(float3 p, const float3 center, const float h, const float r)
+{
+    p.y += h / 4;   //Center the object in the middle
+    p -= center;
+    p.y -= clamp(p.y, .0, h / 2);
+    return length(p) - r;
+}
+
+// [EXPERIMENTAL: Broken base]
+float PyramidDistance(float3 p, const float3 center, const float height, const float2 baseSize)
+{
+    float m2 = height * height + .25;
+
+    p -= center;
+    p.xz = abs(p.xz);
+    p.xz /= abs(baseSize);
+    p.xz = (p.z > p.x) ? p.zx : p.xz;
+    p.xz -= .5;
+    
+    const float3 q = float3(p.z, height * p.y - .5 * p.x, height * p.x + .5 * p.y);
+   
+    const float s = max(-q.x, .0);
+    const float t = clamp((q.y - .5 * p.z) / (m2 + .25), .0, 1. );
+    
+    const float a = m2 * (q.x + s) * (q.x + s) + q.y * q.y;
+    const float b = m2 * (q.x + .5 * t) * (q.x + .5 * t) + (q.y - m2 * t) * (q.y - m2 * t);
+    
+    const float d2 = min(q.y, -q.x * m2 - q.y * .5) > .0 ? .0 : min(a, b);
+    
+    return sqrt((d2 + q.z * q.z) / m2) * sign(max(q.z, -p.y));
+}
+
+Ray CreateRay(const float3 origin, const float3 direction)
+{
+    Ray ray;
+    ray.origin = origin;
+    ray.direction = direction;
+    return ray;
+}
+
+Ray CreateCameraRay(const float2 uv)
+{
+    const float3 origin = mul(_CameraToWorld, CAMERA_ORIGIN).xyz;
+    float3 direction = mul(_CameraInverseProjection, float4(uv, 0, 1)).xyz;
+    direction = normalize(mul(_CameraToWorld, float4(direction,0)).xyz);
+
+    return CreateRay(origin, direction);
+}
+
+// polynomial smooth min (k = 0.1);
+// from https://iquilezles.org/articles/smin/
+float4 Blend(const float a, const float b, const float3 colA, const float3 colB, float k)
+{
+    float h = clamp(0.5 + 0.5 * (b - a) / k, 0.0, 1.0 );
+    float blendDst = lerp(b, a, h) - k * h * (1.0 - h);
+    float3 blendCol = lerp(colB,colA, h);
+    return float4(blendCol, blendDst);
+}
+
+
+float4 Combine(const float distanceA, const float distanceB, const float3 colourA, const float3 colourB,
+    const int operation, const float shapeBlendStrength)
+{
+    float distance = distanceA;
+    float3 colour = colourA;
+
+    switch (operation)
+    {
+    case 0: // None
+    {
+        if(distanceB < distanceA)
+        {
+            distance = distanceB;
+            colour = colourB;
+        }
+            break;
+    }
+    case 1: // Blend
+    {
+        const float4 blend = Blend(
+            distanceA,
+            distanceB,
+            colourA,
+            colourB,
+            shapeBlendStrength);
+        distance = blend.w;
+        colour = blend.xyz;
+            break;
+    }
+    case 2: // Cut
+    {
+        if(-distanceB > distanceA)
+        {
+            distance = -distanceB;
+            colour = colourA;
+        }
+            break;
+    }
+    case 3: // Mask
+    {
+        if(distanceB > distanceA)
+        {
+            distance = distanceB;
+            colour = colourB;
+        }
+            break;
+    }   
+    default: break;
+    }
+
+    return float4(colour, distance);
+}
+
+float GetShapeDistance(const float3 p, Shape shape)
+{
+    switch (shape.shapeType)
+    {
+        case 0: return SphereDistance(p, shape.position, shape.size.x);
+        case 1: return CubeDistance(p, shape.position, shape.size);
+        // case 2: return ConeDistance(p, shape.position, shape.size.xz, shape.size.y);
+        case 3: return PyramidDistance(p, shape.position, shape.size.y, shape.size.xz);
+        case 4: return CapsuleDistance(p, shape.position, shape.size.y, shape.size.x);
+        case 5: return TorusDistance(p, shape.position, shape.size.x, shape.size.y);
+        default: return MAX_DST; 
+    }
+}
+
+float4 SceneInfo(const float3 p)
+{
+    float globalDistance = MAX_DST;
+    float3 globalColour = 1;
+
+    for (int i = 0; i < numberShapes; i++)
+    {
+        Shape shape = Shapes[i];
+        const int numChildren = shape.numChildren;
+
+        float localDistance = GetShapeDistance(p, shape);
+        float3 localColour = shape.colour;
+
+        for (int j = 0; j < numChildren; j++)
+        {
+            const Shape childShape = Shapes[i+j+1];
+            const float childDistance = GetShapeDistance(p, childShape);
+            const float4 combined = Combine(
+                localDistance,
+                childDistance,
+                localColour,
+                childShape.colour,
+                childShape.operationType,
+                childShape.blendStrength);
+            localDistance = combined.w;
+            localColour = combined.xyz;
+        }
+
+        i += numChildren;   // Skip over children in outer loop
+
+        const float4 globalCombined = Combine(
+            globalDistance,
+            localDistance,
+            globalColour,
+            localColour,
+            shape.operationType,
+            shape.blendStrength);
+        globalDistance = globalCombined.w;
+        globalColour = globalCombined.xyz;
+    }
+
+    return float4(globalColour, globalDistance);
+}
+
+float3 EstimateNormal(const float3 p)
+{
+    float x = SceneInfo(float3(p.x + EPSILON, p.y, p.z)).w - SceneInfo(float3(p.x - EPSILON, p.y, p.z)).w;
+    float y = SceneInfo(float3(p.x, p.y + EPSILON, p.z)).w - SceneInfo(float3(p.x, p.y - EPSILON, p.z)).w;
+    float z = SceneInfo(float3(p.x, p.y, p.z + EPSILON)).w - SceneInfo(float3(p.x, p.y, p.z-EPSILON)).w;
+    return normalize(float3(x,y,z));
+}
+
+
+float CalculateShadow(Ray ray, const float distanceToShadeP)
+{
+    float rayDistance = 0;
+    int marchSteps = 0;
+    const float lightIntensity = 2;
+    float brightness = 1;
+
+    while (rayDistance < distanceToShadeP)
+    {
+        marchSteps++;
+        const float4 sceneInfo = SceneInfo(ray.origin);
+        const float distance = sceneInfo.w;
+
+        if(distance <= EPSILON)
+        {
+            return lightIntensity;
+        }
+
+        brightness = min(brightness, distance * 200);
+        ray.origin += ray.direction * distance;
+        rayDistance += distance;
+    }
+
+    return lightIntensity + (1 - lightIntensity) * brightness;
+}
+
+[numthreads(8,8,1)]
+void CSMain (uint3 id : SV_DispatchThreadID)
+{
+    uint width, height;
+    Destination.GetDimensions(width, height);
+    Destination[id.xy] = Source[id.xy];
+
+    const float2 uv = id.xy / float2(width, height) * 2 - 1;
+    float rayDistance = 0;
+
+    Ray ray = CreateCameraRay(uv);
+    int marchSteps = 0;
+
+    while (rayDistance < MAX_DST)
+    {
+        marchSteps++;
+        const float4 sceneInfo = SceneInfo(ray.origin);
+        const float dst = sceneInfo.w;
+
+        if(dst <= EPSILON)
+        {
+            const float3 pointOnSurface = ray.origin + ray.direction * dst;
+            const float3 normal = EstimateNormal(pointOnSurface - ray.direction * EPSILON);
+            const float3 lightDirection = (positionLight) ? normalize(_Light - ray.origin) : -_Light;
+            const float lighting = saturate(saturate(dot(normal, lightDirection)));
+            const float3 col = sceneInfo.xyz;
+
+            // Shadow
+            const float3 offsetPos = pointOnSurface + normal * SHADOW_BIAS;
+            const float3 directionToLight = (positionLight) ? normalize(_Light - offsetPos) : _Light;
+
+            ray.origin = offsetPos;
+            ray.direction = directionToLight;
+
+            const float distanceToLight = (positionLight) ? distance(offsetPos, _Light) : MAX_DST;
+            const float shadow = CalculateShadow(ray, distanceToLight);
+
+            Destination[id.xy] = float4(col * lighting * shadow, 1);
+            break;
+        }
+
+        ray.origin += ray.direction * dst;
+        rayDistance += dst;
+    }
+}
